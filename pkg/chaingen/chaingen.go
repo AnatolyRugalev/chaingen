@@ -251,8 +251,6 @@ func (f *File) L(s ...string) {
 
 func (f *File) TypeIdentifier(typ types.Type) string {
 	switch t := typ.(type) {
-	case *types.Basic:
-		return t.String()
 	case *types.Named:
 		pkg := t.Obj().Pkg()
 		if pkg.Path() == f.Package.PkgPath {
@@ -262,7 +260,7 @@ func (f *File) TypeIdentifier(typ types.Type) string {
 	case *types.Pointer:
 		return "*" + f.TypeIdentifier(t.Elem())
 	default:
-		panic(t)
+		return t.String()
 	}
 }
 
