@@ -1,4 +1,4 @@
-//go:generate go run github.com/AnatolyRugalev/chaingen/cmd/chaingen
+//go:generate go run github.com/AnatolyRugalev/chaingen
 
 package sql_builder
 
@@ -24,10 +24,10 @@ func (w WhereBuilder) Build() string {
 }
 
 type SQLBuilder struct {
-	WhereBuilder
-	offset.OffsetBuilder
+	W WhereBuilder         `chaingen:"-Build,*=Where*,*Where=*"`
+	O offset.OffsetBuilder `chaingen:"-Build,*=Offset*,*Offset=*"`
 }
 
 func (s SQLBuilder) Build() string {
-	return s.WhereBuilder.Build() + " " + s.OffsetBuilder.Build()
+	return s.W.Build() + " " + s.O.Build()
 }

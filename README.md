@@ -144,14 +144,21 @@ You can alter chaingen behavior using these options:
 
 ```
 Usage of chaingen:
+  -build-tag string
+        Sets go build tag name that is used to ignore generated files while analyzing code (default "chaingen")
+  -err-on-conflict
+        Whether to return error if method naming conflict is encountered (default true)
   -file-suffix string
         Generated file suffix, including '.go' (default ".chaingen.go")
   -recursive
         Whether to recuresively generate code for nested builders (default true)
   -src string
         Builder package directory (default "/home/anatoly/projects/AnatolyRugalev/chaingen")
+  -struct-tag string
+        Sets struct tag name to use (default "chaingen")
   -type string
         Builder struct type name. If not set, all struct types will be considered
+
 ```
 
 ### Go Generate
