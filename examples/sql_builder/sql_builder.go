@@ -25,7 +25,7 @@ func (w WhereBuilder) Build() string {
 
 type SQLBuilder struct {
 	W WhereBuilder         `chaingen:"-Build,*=Where*,*Where=*"`
-	O offset.OffsetBuilder `chaingen:"-Build,*=Offset*,*Offset=*"`
+	O offset.OffsetBuilder `chaingen:"-Build,Offset*=*"`
 }
 
 func (s SQLBuilder) Build() string {

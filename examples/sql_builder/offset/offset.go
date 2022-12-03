@@ -5,7 +5,7 @@ import (
 )
 
 type OffsetBuilder struct {
-	L      LimitBuilder `chaingen:"*=Limit*,*Limit=*"`
+	L      LimitBuilder
 	offset int
 }
 
