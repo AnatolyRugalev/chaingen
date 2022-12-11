@@ -26,8 +26,8 @@ func (s SQLBuilder) Limit(limit int) SQLBuilder {
 }
 
 // GetLimit returns the limit
-func (s SQLBuilder) GetLimit() int {
-	return s.O.GetLimit()
+func (s SQLBuilder) GetLimit() error {
+	return s.wrapper(s.O.GetLimit())
 }
 
 func (s SQLBuilder) ChainMethodWithExternalType(param1 *log.Logger, param2 packages.Module) SQLBuilder {

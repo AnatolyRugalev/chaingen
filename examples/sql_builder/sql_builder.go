@@ -24,10 +24,16 @@ func (w WhereBuilder) Build() string {
 }
 
 type SQLBuilder struct {
+	// TODO: auto-resolve method conflicts if parent builder already has it anyway
 	W WhereBuilder         `chaingen:"-Build,*=Where*,*Where=*"`
-	O offset.OffsetBuilder `chaingen:"-Build,Offset*=*"`
+	O offset.OffsetBuilder `chaingen:"-Build,Offset*=*,fin(GetLimit)=wrapper"`
 }
 
 func (s SQLBuilder) Build() string {
 	return s.W.Build() + " " + s.O.Build()
+}
+
+func (s SQLBuilder) wrapper(params ...any) error {
+
+	return nil
 }
