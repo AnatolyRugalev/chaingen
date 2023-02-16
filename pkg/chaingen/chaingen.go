@@ -68,6 +68,7 @@ type Method struct {
 	Recv          MethodParam
 	Params        []MethodParam
 	Results       []MethodParam
+	Prefixes      []string
 	FinalizerName string
 }
 
@@ -213,6 +214,9 @@ func (b *Builder) RenderFinalizer(file *File, method Method) {
 		file.P("return ")
 	}
 	if method.FinalizerName != "" {
+		for _, prefix := range method.Prefixes {
+			file.L(prefix)
+		}
 		file.P(b.ReceiverName(), ".", method.FinalizerName, "(")
 	}
 	file.P(ref, `.`, method.Name, `(`, strings.Join(callParams, ", "), `)`)
@@ -421,6 +425,17 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 							break
 						}
 					}
+				}
+				newPool[method.Alias] = method
+			}
+			pool = newPool
+		case strings.HasPrefix(modifier, "pre("):
+			selector := parts[0][4 : len(parts[0])-1]
+			glob := NewGlob(selector)
+			newPool := make(map[string]Method, len(pool))
+			for _, method := range pool {
+				if glob.Match(method.Recv.Type.(*types.Named).Obj().Name(), method.Alias) {
+					method.Prefixes = append(method.Prefixes, parts[1])
 				}
 				newPool[method.Alias] = method
 			}
