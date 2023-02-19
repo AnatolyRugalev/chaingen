@@ -42,6 +42,7 @@ type Builder struct {
 	FilePath         string
 	Rendered         bool
 	GeneratedMethods []Method
+	Depth            int
 }
 
 type BuilderRef struct {
@@ -77,8 +78,9 @@ func (m Method) String() string {
 }
 
 type MethodParam struct {
-	Name string
-	Type types.Type
+	Name  string
+	Type  types.Type
+	Named *types.Named
 }
 
 func NewMethod(builder *Builder, f *types.Func, sig *types.Signature) Method {
@@ -91,8 +93,9 @@ func NewMethod(builder *Builder, f *types.Func, sig *types.Signature) Method {
 		Builder:  builder,
 		Exported: f.Exported(),
 		Recv: MethodParam{
-			Name: sig.Recv().Name(),
-			Type: sig.Recv().Type(),
+			Name:  sig.Recv().Name(),
+			Type:  sig.Recv().Type(),
+			Named: builderType(sig.Recv().Type()),
 		},
 	}
 	for i := 0; i < sig.Params().Len(); i++ {
@@ -317,13 +320,20 @@ func (f *File) TypeIdentifier(typ types.Type) string {
 	switch t := typ.(type) {
 	case *types.Named:
 		pkg := t.Obj().Pkg()
-		if pkg == nil {
-			return t.Obj().Name()
+		pkgPath := ""
+		if pkg != nil && pkg.Path() != f.Package.PkgPath {
+			pkgPath = f.PackageIdentifier(pkg) + "."
 		}
-		if pkg.Path() == f.Package.PkgPath {
-			return t.Obj().Name()
+
+		typeArgs := ""
+		if ta := t.TypeArgs(); ta != nil {
+			var args []string
+			for i := 0; i < ta.Len(); i++ {
+				args = append(args, f.TypeIdentifier(ta.At(i)))
+			}
+			typeArgs = "[" + strings.Join(args, ", ") + "]"
 		}
-		return f.PackageIdentifier(pkg) + "." + t.Obj().Name()
+		return pkgPath + t.Obj().Name() + typeArgs
 	case *types.Slice:
 		return "[]" + f.TypeIdentifier(t.Elem())
 	case *types.Map:
@@ -361,21 +371,15 @@ func (f *File) PackageIdentifier(pkg *types.Package) string {
 func (c Chaingen) Render(builders map[*types.Named]*Builder) (map[string]*File, error) {
 	files := make(map[string]*File)
 	for _, builder := range builders {
+		if builder.Depth > 0 {
+			continue
+		}
 		err := c.render(files, builder)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return files, nil
-}
-
-func (b *Builder) HasChainingMethods() bool {
-	for _, m := range b.Methods {
-		if m.IsChaining() {
-			return true
-		}
-	}
-	return false
 }
 
 func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method) ([]Method, error) {
@@ -405,7 +409,7 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 			glob := NewGlob(selector)
 			newPool := make(map[string]Method, len(pool))
 			for _, method := range pool {
-				if glob.Match(method.Recv.Type.(*types.Named).Obj().Name(), method.Alias) {
+				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
 					for _, m := range builderMethods {
 						if m.Name == parts[1] {
 							compatible := m.Variadic
@@ -434,7 +438,7 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 			glob := NewGlob(selector)
 			newPool := make(map[string]Method, len(pool))
 			for _, method := range pool {
-				if glob.Match(method.Recv.Type.(*types.Named).Obj().Name(), method.Alias) {
+				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
 					method.Prefixes = append(method.Prefixes, parts[1])
 				}
 				newPool[method.Alias] = method
@@ -449,7 +453,7 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 			}
 			newPool := make(map[string]Method, len(pool))
 			for _, method := range pool {
-				if left.Match(method.Recv.Type.(*types.Named).Obj().Name(), method.Alias) {
+				if left.Match(method.Recv.Named.Obj().Name(), method.Alias) {
 					method.Alias = left.Replace(method.Alias, right)
 				}
 				newPool[method.Alias] = method
@@ -725,20 +729,23 @@ func (c Chaingen) Generate() error {
 }
 
 func (c Chaingen) NewBuilder(builders map[*types.Named]*Builder, pkg *packages.Package, n *types.Named) error {
-	_, err := c.newBuilder(builders, pkg, n)
+	_, err := c.newBuilder(builders, pkg, n, 0)
 	return err
 }
 
-func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.Package, typ *types.Named) (*Builder, error) {
+func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.Package, typ *types.Named, depth int) (*Builder, error) {
 	if b, ok := builders[typ]; ok {
 		return b, nil
 	}
 	builder := &Builder{
+		Depth:       depth,
 		Package:     pkg,
 		PkgPath:     pkg.PkgPath,
 		Type:        typ,
-		Struct:      typ.Underlying().(*types.Struct),
 		MethodNames: map[string]*Method{},
+	}
+	if s, ok := typ.Underlying().(*types.Struct); ok {
+		builder.Struct = s
 	}
 	builders[typ] = builder
 
@@ -764,15 +771,15 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 		m := NewMethod(builder, fun, sig)
 		builder.Methods = append(builder.Methods, m)
 	}
+	if builder.Struct == nil {
+		return builder, nil
+	}
 
 	for i := 0; i < builder.Struct.NumFields(); i++ {
 		field := builder.Struct.Field(i)
 		tag, _ := reflect.StructTag(builder.Struct.Tag(i)).Lookup(c.opts.StructTag)
-		typ, ok := field.Type().(*types.Named)
-		if !ok {
-			continue
-		}
-		if !isStruct(typ) {
+		typ := builderType(field.Type())
+		if typ == nil {
 			continue
 		}
 		name := typ.Obj().Name()
@@ -784,7 +791,7 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 		if pkgPath != pkg.PkgPath {
 			childPkg = pkg.Imports[pkgPath]
 		}
-		child, err := c.newBuilder(builders, childPkg, typ)
+		child, err := c.newBuilder(builders, childPkg, typ, depth+1)
 		if err != nil {
 			return nil, fmt.Errorf("error creating builder for field %s: %w", field.Name(), err)
 		}
@@ -817,7 +824,19 @@ func toStruct(obj types.Object) (*types.Named, *types.Struct) {
 	return typ, str
 }
 
-func isStruct(typ *types.Named) bool {
-	_, ok := typ.Underlying().(*types.Struct)
-	return ok
+func builderType(typ types.Type) *types.Named {
+	if n, ok := typ.(*types.Named); ok {
+		_, ok := n.Underlying().(*types.Struct)
+		if ok {
+			return n
+		}
+		_, ok = n.Underlying().(*types.Slice)
+		if ok {
+			return n
+		}
+	}
+	if p, ok := typ.Underlying().(*types.Pointer); ok {
+		return builderType(p.Elem())
+	}
+	return nil
 }
