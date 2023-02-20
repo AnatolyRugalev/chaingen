@@ -828,6 +828,9 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 		if pkgPath != pkg.PkgPath {
 			childPkg = pkg.Imports[pkgPath]
 		}
+		if childPkg == nil {
+			continue
+		}
 		child, err := c.newBuilder(builders, childPkg, typ, depth+1)
 		if err != nil {
 			return nil, fmt.Errorf("error creating builder for field %s: %w", field.Name(), err)
