@@ -66,11 +66,13 @@ type Method struct {
 	Builder      *Builder
 	BuilderField string
 
-	Recv          MethodParam
-	Params        []MethodParam
-	Results       []MethodParam
-	Prefixes      []string
-	FinalizerName string
+	Recv        MethodParam
+	Params      []MethodParam
+	Results     []MethodParam
+	Prefixes    []string
+	Postfixes   []string
+	WrapperName string
+	Pointer     bool
 }
 
 func (m Method) String() string {
@@ -122,8 +124,11 @@ func (b *Builder) ReceiverName() string {
 	return strings.ToLower(b.Type.Obj().Name()[0:1])
 }
 
-func (b *Builder) ReceiverType() string {
+func (b *Builder) ReceiverType(ptr bool) string {
 	s := strings.Builder{}
+	if ptr {
+		s.WriteRune('*')
+	}
 	s.WriteString(b.Type.Obj().Name())
 	tps := b.Type.TypeParams()
 	var tpss []string
@@ -167,8 +172,14 @@ func (b *Builder) RenderChainMethod(file *File, method Method) {
 		}
 	}
 	ref := b.ReceiverName() + "." + b.Ref(method.Builder).Name
-	file.L(`func (` + b.ReceiverName() + ` ` + b.ReceiverType() + `) ` + method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + b.ReceiverType() + " {")
+	file.L(`func (` + b.ReceiverName() + ` ` + b.ReceiverType(method.Pointer) + `) ` + method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + b.ReceiverType(method.Pointer) + " {")
+	for _, prefix := range method.Prefixes {
+		file.L(prefix)
+	}
 	file.L("\t" + ref + ` = ` + ref + `.` + method.Name + `(` + strings.Join(callParams, ", ") + `)`)
+	for _, postfix := range method.Postfixes {
+		file.L(postfix)
+	}
 	file.L("\treturn " + b.ReceiverName())
 	file.L("}")
 }
@@ -211,19 +222,23 @@ func (b *Builder) RenderFinalizer(file *File, method Method) {
 		}
 	}
 	ref := b.ReceiverName() + "." + b.Ref(method.Builder).Name
-	file.L(`func (` + b.ReceiverName() + ` ` + b.ReceiverType() + `) ` + method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + outputParamsStr + " {")
-	file.P("\t")
+	file.L(`func (` + b.ReceiverName() + ` ` + b.ReceiverType(method.Pointer) + `) ` + method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + outputParamsStr + " {")
+	for _, prefix := range method.Prefixes {
+		file.L(prefix)
+	}
+	for _, postfix := range method.Postfixes {
+		file.L("defer func() {")
+		file.L(postfix)
+		file.L("}()")
+	}
 	if len(outputParams) > 0 {
 		file.P("return ")
 	}
-	if method.FinalizerName != "" {
-		for _, prefix := range method.Prefixes {
-			file.L(prefix)
-		}
-		file.P(b.ReceiverName(), ".", method.FinalizerName, "(")
+	if method.WrapperName != "" {
+		file.P(b.ReceiverName(), ".", method.WrapperName, "(")
 	}
 	file.P(ref, `.`, method.Name, `(`, strings.Join(callParams, ", "), `)`)
-	if method.FinalizerName != "" {
+	if method.WrapperName != "" {
 		file.P(")")
 	}
 	file.L("}")
@@ -237,7 +252,7 @@ func (m Method) IsChaining() bool {
 }
 
 func (m Method) IsFinalizer() bool {
-	if m.FinalizerName != "" {
+	if m.WrapperName != "" {
 		return true
 	}
 	return !m.IsChaining()
@@ -404,8 +419,8 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 			break
 		case modifier[0] == '-':
 			delete(pool, modifier[1:])
-		case strings.HasPrefix(modifier, "fin("):
-			selector := parts[0][4 : len(parts[0])-1]
+		case strings.HasPrefix(modifier, "wrap("):
+			selector := parts[0][5 : len(parts[0])-1]
 			glob := NewGlob(selector)
 			newPool := make(map[string]Method, len(pool))
 			for _, method := range pool {
@@ -423,12 +438,23 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 								}
 							}
 							if compatible {
-								method.FinalizerName = parts[1]
+								method.WrapperName = parts[1]
 								method.Results = m.Results
 							}
 							break
 						}
 					}
+				}
+				newPool[method.Alias] = method
+			}
+			pool = newPool
+		case strings.HasPrefix(modifier, "ptr("):
+			selector := parts[0][4 : len(parts[0])-1]
+			glob := NewGlob(selector)
+			newPool := make(map[string]Method, len(pool))
+			for _, method := range pool {
+				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
+					method.Pointer = true
 				}
 				newPool[method.Alias] = method
 			}
@@ -440,6 +466,17 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 			for _, method := range pool {
 				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
 					method.Prefixes = append(method.Prefixes, parts[1])
+				}
+				newPool[method.Alias] = method
+			}
+			pool = newPool
+		case strings.HasPrefix(modifier, "post("):
+			selector := parts[0][5 : len(parts[0])-1]
+			glob := NewGlob(selector)
+			newPool := make(map[string]Method, len(pool))
+			for _, method := range pool {
+				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
+					method.Postfixes = append(method.Postfixes, parts[1])
 				}
 				newPool[method.Alias] = method
 			}
@@ -831,6 +868,10 @@ func builderType(typ types.Type) *types.Named {
 			return n
 		}
 		_, ok = n.Underlying().(*types.Slice)
+		if ok {
+			return n
+		}
+		_, ok = n.Underlying().(*types.Signature)
 		if ok {
 			return n
 		}
