@@ -423,29 +423,32 @@ func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method)
 			selector := parts[0][5 : len(parts[0])-1]
 			glob := NewGlob(selector)
 			newPool := make(map[string]Method, len(pool))
+			wrappers := strings.Split(parts[1], "|")
 			for _, method := range pool {
-				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
-					for _, m := range builderMethods {
-						if m.Name == parts[1] {
-							compatible := m.Variadic
-							if !compatible && len(m.Params) == len(method.Results) {
-								compatible = true
-								for i := 0; i < len(m.Params); i++ {
-									if m.Params[i].Type.String() != method.Results[i].Type.String() {
-										compatible = false
-										break
+				for _, wrapperName := range wrappers {
+					if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
+						for _, m := range builderMethods {
+							if m.Name == wrapperName {
+								compatible := m.Variadic
+								if !compatible && len(m.Params) == len(method.Results) {
+									compatible = true
+									for i := 0; i < len(m.Params); i++ {
+										if m.Params[i].Type.String() != method.Results[i].Type.String() {
+											compatible = false
+											break
+										}
 									}
 								}
+								if compatible {
+									method.WrapperName = wrapperName
+									method.Results = m.Results
+								}
+								break
 							}
-							if compatible {
-								method.WrapperName = parts[1]
-								method.Results = m.Results
-							}
-							break
 						}
 					}
+					newPool[method.Alias] = method
 				}
-				newPool[method.Alias] = method
 			}
 			pool = newPool
 		case strings.HasPrefix(modifier, "ptr("):
