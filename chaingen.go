@@ -18,8 +18,8 @@ var (
 func init() {
 	wd, _ := os.Getwd()
 	flags.StringVar(&options.Src, "src", wd, "Builder package directory")
-	flags.StringVar(&options.TypeName, "type", "", "Builder struct type name. If not set, all struct types will be considered")
-	flags.BoolVar(&options.Recursive, "recursive", true, "Whether to recuresively generate code for nested builders")
+	flags.StringVar(&options.TypeName, "type", "", "Builder type names, separated by comma")
+	flags.BoolVar(&options.Recursive, "recursive", false, "Whether to recuresively generate code for nested builders")
 	flags.StringVar(&options.FileSuffix, "file-suffix", ".chaingen.go", "Generated file suffix, including '.go'")
 	flags.BoolVar(&options.ErrOnConflict, "err-on-conflict", true, "Whether to return error if method naming conflict is encountered")
 	flags.StringVar(&options.StructTag, "struct-tag", "chaingen", "Sets struct tag name to use")

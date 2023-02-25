@@ -34,6 +34,7 @@ type Builder struct {
 	PkgPath          string
 	Package          *packages.Package
 	Type             *types.Named
+	Annotations      []string
 	Struct           *types.Struct
 	Methods          []Method
 	Children         []*BuilderRef
@@ -46,9 +47,10 @@ type Builder struct {
 }
 
 type BuilderRef struct {
-	Name    string
-	Tag     string
-	Builder *Builder
+	Name            string
+	IsMethod        bool
+	FieldAnnotation string
+	Builder         *Builder
 }
 
 type Import struct {
@@ -57,14 +59,13 @@ type Import struct {
 }
 
 type Method struct {
-	Name         string
-	Alias        string
-	Scope        *types.Scope
-	Pos          token.Pos
-	Variadic     bool
-	Exported     bool
-	Builder      *Builder
-	BuilderField string
+	Name     string
+	Alias    string
+	Scope    *types.Scope
+	Pos      token.Pos
+	Variadic bool
+	Exported bool
+	Builder  *Builder
 
 	Recv        MethodParam
 	Params      []MethodParam
@@ -397,7 +398,7 @@ func (c Chaingen) Render(builders map[*types.Named]*Builder) (map[string]*File, 
 	return files, nil
 }
 
-func (c Chaingen) evalTag(tag string, methods []Method, builderMethods []Method) ([]Method, error) {
+func (c Chaingen) evalAnnotations(tag string, methods []Method, builderMethods []Method) ([]Method, error) {
 	if tag == "" || tag == "*" {
 		return methods, nil
 	}
@@ -630,7 +631,7 @@ func (c Chaingen) render(files map[string]*File, builder *Builder) error {
 		}
 		methods = append(methods, child.Builder.Methods...)
 
-		methods, err := c.evalTag(child.Tag, methods, builder.Methods)
+		methods, err := c.evalAnnotations(child.FieldAnnotation, methods, builder.Methods)
 		if err != nil {
 			return err
 		}
@@ -645,7 +646,7 @@ func (c Chaingen) render(files map[string]*File, builder *Builder) error {
 				continue
 			}
 			switch {
-			case m.IsChaining():
+			case !child.IsMethod && m.IsChaining():
 				builder.RenderChainMethod(file, m)
 				builder.MethodNames[m.Alias] = &m
 				generated := m
@@ -703,31 +704,18 @@ func (c Chaingen) Generate() error {
 	}
 
 	found := make(map[*types.Named]*packages.Package)
-	if c.opts.TypeName == "" {
-		for _, p := range pkgs {
-			for _, name := range p.Types.Scope().Names() {
-				typ, _ := toStruct(p.Types.Scope().Lookup(name))
-				if typ != nil {
-					found[typ] = p
-				}
+
+	names := strings.Split(c.opts.TypeName, ",")
+	for _, p := range pkgs {
+		for _, name := range names {
+			typ := builderType(objToType(p.Types.Scope().Lookup(name)))
+			if typ != nil {
+				found[typ] = p
 			}
 		}
-		if len(found) == 0 {
-			return fmt.Errorf("unable to find structs in %s", c.opts.Src)
-		}
-	} else {
-		names := strings.Split(c.opts.TypeName, ",")
-		for _, p := range pkgs {
-			for _, name := range names {
-				typ, _ := toStruct(p.Types.Scope().Lookup(name))
-				if typ != nil {
-					found[typ] = p
-				}
-			}
-		}
-		if len(found) == 0 {
-			return fmt.Errorf("unable to find struct type %q in %s", c.opts.TypeName, c.opts.Src)
-		}
+	}
+	if len(found) == 0 {
+		return fmt.Errorf("unable to find builder type %q in %s", c.opts.TypeName, c.opts.Src)
 	}
 
 	builders := map[*types.Named]*Builder{}
@@ -766,6 +754,11 @@ func (c Chaingen) Generate() error {
 		log.Printf("generated file: %s", rel)
 	}
 	return nil
+}
+
+type BuilderSpec struct {
+	Type       *types.Type
+	Annotation string
 }
 
 func (c Chaingen) NewBuilder(builders map[*types.Named]*Builder, pkg *packages.Package, n *types.Named) error {
@@ -811,13 +804,73 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 		m := NewMethod(builder, fun, sig)
 		builder.Methods = append(builder.Methods, m)
 	}
+	// Look up builder comment-based annotations
+
+	typePos := pkg.Fset.Position(builder.Type.Obj().Pos())
+	for _, file := range pkg.Syntax {
+		for _, cg := range file.Comments {
+			commentPos := pkg.Fset.Position(cg.End())
+			if commentPos.Filename == builder.FilePath && commentPos.Line == typePos.Line-1 {
+				for _, comment := range cg.List {
+					annotation := strings.Trim(strings.TrimLeft(comment.Text, "/"), " ")
+					tag, ok := reflect.StructTag(annotation).Lookup(c.opts.StructTag)
+					if ok {
+						builder.Annotations = append(builder.Annotations, tag)
+					}
+				}
+			}
+		}
+	}
+
+	for _, annotation := range builder.Annotations {
+		if strings.HasPrefix(annotation, "ext(") {
+			methodName := annotation[4:strings.Index(annotation, ")")]
+			for _, method := range builder.Methods {
+				if method.Name != methodName {
+					continue
+				}
+				if len(method.Results) != 1 || len(method.Params) != 0 {
+					break
+				}
+				typ := builderType(method.Results[0].Type)
+				if typ == nil {
+					break
+				}
+
+				childPkg := pkg
+				pkgPath := typ.Obj().Pkg().Path()
+				if pkgPath != pkg.PkgPath {
+					childPkg = pkg.Imports[pkgPath]
+				}
+				if childPkg == nil {
+					continue
+				}
+				child, err := c.newBuilder(builders, childPkg, typ, depth+1)
+				if err != nil {
+					return nil, fmt.Errorf("error creating external builder %s: %w", methodName, err)
+				}
+				var fieldAnnotation string
+				parts := strings.Split(annotation, "=")
+				if len(parts) == 2 {
+					fieldAnnotation = parts[1]
+				}
+				builder.Children = append(builder.Children, &BuilderRef{
+					Name:            methodName + "()",
+					IsMethod:        true,
+					FieldAnnotation: fieldAnnotation,
+					Builder:         child,
+				})
+				break
+			}
+		}
+	}
 	if builder.Struct == nil {
 		return builder, nil
 	}
 
 	for i := 0; i < builder.Struct.NumFields(); i++ {
 		field := builder.Struct.Field(i)
-		tag, _ := reflect.StructTag(builder.Struct.Tag(i)).Lookup(c.opts.StructTag)
+		fieldAnnotation, _ := reflect.StructTag(builder.Struct.Tag(i)).Lookup(c.opts.StructTag)
 		typ := builderType(field.Type())
 		if typ == nil {
 			continue
@@ -839,35 +892,30 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 			return nil, fmt.Errorf("error creating builder for field %s: %w", field.Name(), err)
 		}
 		builder.Children = append(builder.Children, &BuilderRef{
-			Name:    name,
-			Tag:     tag,
-			Builder: child,
+			Name:            name,
+			FieldAnnotation: fieldAnnotation,
+			Builder:         child,
 		})
 	}
 
 	return builder, nil
 }
 
-func toStruct(obj types.Object) (*types.Named, *types.Struct) {
+func objToType(obj types.Object) types.Type {
 	if obj == nil {
-		return nil, nil
+		return nil
 	}
 	typName, ok := obj.(*types.TypeName)
 	if !ok {
-		return nil, nil
+		return nil
 	}
-	typ, ok := typName.Type().(*types.Named)
-	if !ok {
-		return nil, nil
-	}
-	str, ok := typ.Underlying().(*types.Struct)
-	if !ok {
-		return nil, nil
-	}
-	return typ, str
+	return typName.Type()
 }
 
 func builderType(typ types.Type) *types.Named {
+	if typ == nil {
+		return nil
+	}
 	if n, ok := typ.(*types.Named); ok {
 		_, ok := n.Underlying().(*types.Struct)
 		if ok {
