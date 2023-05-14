@@ -31,26 +31,28 @@ func New(opts Options) Chaingen {
 // Builder has at least one method that returns altered Builder copy (chaining method).
 // Every non-chaining method is considered as finalizer
 type Builder struct {
-	PkgPath          string
-	Package          *packages.Package
-	Type             *types.Named
-	Annotations      []string
-	Struct           *types.Struct
-	Methods          []Method
-	Children         []*BuilderRef
-	MethodNames      map[string]*Method
-	File             *ast.File
-	FilePath         string
-	Rendered         bool
-	GeneratedMethods []Method
-	Depth            int
+	PkgPath            string
+	Package            *packages.Package
+	Type               *types.Named
+	Annotations        []string
+	Struct             *types.Struct
+	Methods            []Method
+	GeneratedMethods   []Method
+	GeneratedFunctions []Method
+	Children           []*BuilderRef
+	MethodNames        map[string]*Method
+	File               *ast.File
+	FilePath           string
+	Rendered           bool
+	Depth              int
 }
 
 type BuilderRef struct {
-	Name            string
-	IsMethod        bool
-	FieldAnnotation string
-	Builder         *Builder
+	Name             string
+	IsMethod         bool
+	FieldAnnotation  string
+	Builder          *Builder
+	GeneratedMethods []Method
 }
 
 type Import struct {
@@ -61,29 +63,45 @@ type Import struct {
 type Method struct {
 	Name     string
 	Alias    string
-	Scope    *types.Scope
 	Pos      token.Pos
 	Variadic bool
 	Exported bool
 	Builder  *Builder
+	Ref      *BuilderRef
 
-	Recv        MethodParam
-	Params      []MethodParam
-	Results     []MethodParam
-	Prefixes    []string
-	Postfixes   []string
-	WrapperName string
-	Pointer     bool
+	Recv           FuncParam
+	Params         []FuncParam
+	Results        []FuncParam
+	Prefixes       []string
+	Postfixes      []string
+	WrapperName    string
+	Pointer        bool
+	Picked         bool
+	VariadicUnwrap bool
+	PkgExport      bool
 }
 
 func (m Method) String() string {
 	return m.Builder.Type.Obj().Name() + "." + m.Name
 }
 
-type MethodParam struct {
-	Name  string
-	Type  types.Type
-	Named *types.Named
+type Function struct {
+	Name     string
+	Alias    string
+	Variadic bool
+	Exported bool
+	Builder  *Builder
+	Ref      *BuilderRef
+
+	Params  []FuncParam
+	Results []FuncParam
+}
+
+type FuncParam struct {
+	Name   string
+	Type   types.Type
+	Prefix string
+	Suffix string
 }
 
 func NewMethod(builder *Builder, f *types.Func, sig *types.Signature) Method {
@@ -91,26 +109,24 @@ func NewMethod(builder *Builder, f *types.Func, sig *types.Signature) Method {
 		Name:     f.Name(),
 		Alias:    f.Name(),
 		Pos:      f.Pos(),
-		Scope:    f.Scope(),
 		Variadic: sig.Variadic(),
 		Builder:  builder,
 		Exported: f.Exported(),
-		Recv: MethodParam{
-			Name:  sig.Recv().Name(),
-			Type:  sig.Recv().Type(),
-			Named: builderType(sig.Recv().Type()),
+		Recv: FuncParam{
+			Name: sig.Recv().Name(),
+			Type: sig.Recv().Type(),
 		},
 	}
 	for i := 0; i < sig.Params().Len(); i++ {
 		param := sig.Params().At(i)
-		m.Params = append(m.Params, MethodParam{
+		m.Params = append(m.Params, FuncParam{
 			Name: param.Name(),
 			Type: param.Type(),
 		})
 	}
 	for i := 0; i < sig.Results().Len(); i++ {
 		param := sig.Results().At(i)
-		m.Results = append(m.Results, MethodParam{
+		m.Results = append(m.Results, FuncParam{
 			Name: param.Name(),
 			Type: param.Type(),
 		})
@@ -119,13 +135,28 @@ func NewMethod(builder *Builder, f *types.Func, sig *types.Signature) Method {
 }
 
 func (b *Builder) ReceiverName() string {
-	if len(b.Methods) > 0 {
-		return b.Methods[0].Recv.Name
+	var name string
+	for _, m := range b.Methods {
+		if m.Recv.Name != "" {
+			name = m.Recv.Name
+			break
+		}
 	}
-	return strings.ToLower(b.Type.Obj().Name()[0:1])
+	if name == "" {
+		name = strings.ToLower(b.Type.Obj().Name()[0:1])
+	}
+	return name
 }
 
-func (b *Builder) ReceiverType(ptr bool) string {
+func (b *Builder) ReceiverType() types.Type {
+	for _, m := range b.Methods {
+		return m.Recv.Type
+	}
+	// TODO: this works poorly with type params
+	return b.Type
+}
+
+func (b *Builder) ReceiverTypeName(ptr bool) string {
 	s := strings.Builder{}
 	if ptr {
 		s.WriteRune('*')
@@ -152,69 +183,53 @@ func (b *Builder) Ref(builder *Builder) *BuilderRef {
 	return nil
 }
 
-func (b *Builder) RenderChainMethod(file *File, method Method) {
+func (b *Builder) RenderSignature(file *File, method Method, unwrap bool) (string, []string) {
 	var inputParams []string
 	var callParams []string
 	for i, param := range method.Params {
 		last := i == len(method.Params)-1
 		if last && method.Variadic {
-			inputParams = append(inputParams, param.Name+" ..."+file.TypeIdentifier(param.Type.(*types.Slice).Elem()))
-			callParams = append(callParams, param.Name+"...")
+			typ := file.TypeIdentifier(param.Type.(*types.Slice).Elem())
+			out := param.Name + "..."
+			if unwrap {
+				param.Prefix = strings.ReplaceAll(param.Prefix, "__TYPE__", typ)
+				out = param.Prefix + out + param.Suffix
+			}
+			inputParams = append(inputParams, param.Name+" ..."+typ)
+			callParams = append(callParams, out)
 		} else {
+			typ := file.TypeIdentifier(param.Type)
+			out := param.Name
+			if unwrap {
+				param.Prefix = strings.ReplaceAll(param.Prefix, "__TYPE__", typ)
+				out = param.Prefix + out + param.Suffix
+			}
 			inputParams = append(inputParams, param.Name+" "+file.TypeIdentifier(param.Type))
-			callParams = append(callParams, param.Name)
-		}
-	}
-	file.L()
-	doc := method.Doc()
-	if doc != nil {
-		for _, line := range doc.List {
-			file.L(line.Text)
-		}
-	}
-	ref := b.ReceiverName() + "." + b.Ref(method.Builder).Name
-	file.L(`func (` + b.ReceiverName() + ` ` + b.ReceiverType(method.Pointer) + `) ` + method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + b.ReceiverType(method.Pointer) + " {")
-	for _, prefix := range method.Prefixes {
-		file.L(prefix)
-	}
-	file.L("\t" + ref + ` = ` + ref + `.` + method.Name + `(` + strings.Join(callParams, ", ") + `)`)
-	for _, postfix := range method.Postfixes {
-		file.L(postfix)
-	}
-	file.L("\treturn " + b.ReceiverName())
-	file.L("}")
-}
-
-func (b *Builder) RenderFinalizer(file *File, method Method) {
-	var inputParams []string
-	var callParams []string
-	for i, param := range method.Params {
-		last := i == len(method.Params)-1
-		if last && method.Variadic {
-			inputParams = append(inputParams, param.Name+" ..."+file.TypeIdentifier(param.Type.(*types.Slice).Elem()))
-			callParams = append(callParams, param.Name+"...")
-		} else {
-			inputParams = append(inputParams, param.Name+" "+file.TypeIdentifier(param.Type))
-			callParams = append(callParams, param.Name)
+			callParams = append(callParams, out)
 		}
 	}
 	var outputParams []string
-	for _, param := range method.Results {
+	for i, param := range method.Results {
 		typeName := file.TypeIdentifier(param.Type)
-		if typeName == "" {
-			// TODO: error
-			return
-		}
 		name := param.Name
 		if name != "" {
 			name += " "
 		}
+		if i == 0 && method.Pointer && method.IsChaining() {
+			typeName = "*" + typeName
+		}
 		outputParams = append(outputParams, name+typeName)
 	}
 	outputParamsStr := strings.Join(outputParams, ", ")
-	if len(outputParams) > 1 {
+	if len(outputParams) > 1 || (len(method.Results) == 0 && method.Results[0].Name != "") {
 		outputParamsStr = "(" + outputParamsStr + ")"
 	}
+	return method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + outputParamsStr, callParams
+
+}
+
+func (b *Builder) RenderFunction(file *File, method Method) {
+	signature, callParams := b.RenderSignature(file, method, false)
 	file.L()
 	doc := method.Doc()
 	if doc != nil {
@@ -222,41 +237,72 @@ func (b *Builder) RenderFinalizer(file *File, method Method) {
 			file.L(line.Text)
 		}
 	}
-	ref := b.ReceiverName() + "." + b.Ref(method.Builder).Name
-	file.L(`func (` + b.ReceiverName() + ` ` + b.ReceiverType(method.Pointer) + `) ` + method.Alias + `(` + strings.Join(inputParams, ", ") + `) ` + outputParamsStr + " {")
-	for _, prefix := range method.Prefixes {
-		file.L(prefix)
-	}
-	for _, postfix := range method.Postfixes {
-		file.L("defer func() {")
-		file.L(postfix)
-		file.L("}()")
-	}
-	if len(outputParams) > 0 {
+	file.L("func " + signature + "{ ")
+	if len(method.Results) > 0 {
 		file.P("return ")
 	}
-	if method.WrapperName != "" {
-		file.P(b.ReceiverName(), ".", method.WrapperName, "(")
+	file.P("new(" + file.TypeIdentifier(method.Recv.Type) + ")." + method.Alias + "(" + strings.Join(callParams, ", ") + ")")
+	file.L("")
+	file.L("}")
+}
+
+func (b *Builder) RenderMethod(file *File, method Method) {
+	signature, callParams := b.RenderSignature(file, method, true)
+	file.L()
+	doc := method.Doc()
+	if doc != nil {
+		for _, line := range doc.List {
+			file.L(line.Text)
+		}
 	}
-	file.P(ref, `.`, method.Name, `(`, strings.Join(callParams, ", "), `)`)
-	if method.WrapperName != "" {
-		file.P(")")
+	recv := method.Recv.Name
+	file.L(`func (` + recv + ` ` + b.ReceiverTypeName(method.Pointer) + `) ` + signature + " {")
+	if method.VariadicUnwrap {
+		file.L("out := make(" + file.TypeIdentifier(method.Results[0].Type) + ", len(in))")
+		file.L("for i := range in {")
+		file.L("out[i] = in[i]." + method.Params[0].Suffix)
+		file.L("}")
+		file.L("return out")
+	} else {
+		ref := recv + "." + method.Ref.Name
+		for _, prefix := range method.Prefixes {
+			file.L(prefix)
+		}
+		for _, postfix := range method.Postfixes {
+			file.L("defer func() {")
+			file.L(postfix)
+			file.L("}()")
+		}
+		result := ref + "." + method.Name + "(" + strings.Join(callParams, ", ") + ")"
+		if method.WrapperName != "" {
+			result = recv + "." + method.WrapperName + "(" + result + ")"
+		}
+		if method.IsChaining() {
+			if method.Ref.IsMethod {
+				file.L("return " + result)
+			} else {
+				file.L("\t" + ref + ` = ` + result)
+				file.L("\treturn " + recv)
+			}
+		} else {
+			if len(method.Results) > 0 {
+				file.P("return ")
+			}
+			file.P(result)
+			file.L("")
+		}
 	}
 	file.L("}")
 }
 
 func (m Method) IsChaining() bool {
+	if m.WrapperName != "" {
+		return false
+	}
 	if len(m.Results) != 1 {
 		return false
 	}
-	return m.Results[0].Type == m.Builder.Type
-}
-
-func (m Method) IsFinalizer() bool {
-	if m.WrapperName != "" {
-		return true
-	}
-	return !m.IsChaining()
+	return m.Recv.Type.String() == m.Results[0].Type.String()
 }
 
 const generatedPrefix = "Code generated by chaingen. DO NOT EDIT."
@@ -333,6 +379,9 @@ func (f *File) L(s ...string) {
 }
 
 func (f *File) TypeIdentifier(typ types.Type) string {
+	if typ == nil {
+		panic("oi")
+	}
 	switch t := typ.(type) {
 	case *types.Named:
 		pkg := t.Obj().Pkg()
@@ -346,6 +395,12 @@ func (f *File) TypeIdentifier(typ types.Type) string {
 			var args []string
 			for i := 0; i < ta.Len(); i++ {
 				args = append(args, f.TypeIdentifier(ta.At(i)))
+			}
+			typeArgs = "[" + strings.Join(args, ", ") + "]"
+		} else if tp := t.TypeParams(); tp != nil {
+			var args []string
+			for i := 0; i < tp.Len(); i++ {
+				args = append(args, f.TypeIdentifier(tp.At(i)))
 			}
 			typeArgs = "[" + strings.Join(args, ", ") + "]"
 		}
@@ -384,134 +439,271 @@ func (f *File) PackageIdentifier(pkg *types.Package) string {
 	return i.Alias
 }
 
-func (c Chaingen) Render(builders map[*types.Named]*Builder) (map[string]*File, error) {
-	files := make(map[string]*File)
-	for _, builder := range builders {
-		if builder.Depth > 0 {
-			continue
-		}
-		err := c.render(files, builder)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return files, nil
-}
+var unwrappers = map[string]Method{}
 
-func (c Chaingen) evalAnnotations(tag string, methods []Method, builderMethods []Method) ([]Method, error) {
-	if tag == "" || tag == "*" {
-		return methods, nil
+func (b *Builder) generateMethods() {
+	// this func should be called only after all children are evaluated
+
+	// Collect all methods of all children
+	// We should also take generated methods of the children
+	myMethodsMap := make(map[string]Method, len(b.Methods))
+	visited := map[string]struct{}{}
+	for _, method := range b.Methods {
+		myMethodsMap[method.Alias] = method
+		visited[method.Alias] = struct{}{}
 	}
-	if tag == "-" {
-		return nil, nil
-	}
-	pool := make(map[string]Method, len(methods))
-	for _, method := range methods {
-		pool[method.Alias] = method
-	}
-	modifiers := strings.Split(tag, ",")
-	for _, modifier := range modifiers {
-		if len(modifier) == 0 {
-			continue
+	for _, child := range b.Children {
+		allMethods := append(child.Builder.Methods, child.Builder.GeneratedMethods...)
+		// Evaluate all annotations, then assign results to GeneratedMethods
+		pool := make(map[string]Method, len(allMethods))
+		for _, m := range allMethods {
+			m.Ref = child
+			m.Pointer = false
+			m.WrapperName = ""
+			m.Prefixes = []string{}
+			m.Postfixes = []string{}
+			m.Picked = false
+			pool[m.Alias] = m
 		}
-		parts := strings.Split(modifier, "=")
-		switch {
-		case modifier == "*":
-			break
-		case modifier[0] == '-':
-			delete(pool, modifier[1:])
-		case strings.HasPrefix(modifier, "wrap("):
-			selector := parts[0][5 : len(parts[0])-1]
-			glob := NewGlob(selector)
-			newPool := make(map[string]Method, len(pool))
-			wrappers := strings.Split(parts[1], "|")
-			for _, method := range pool {
+		modifiers := strings.Split(child.FieldAnnotation, ",")
+		for _, modifier := range modifiers {
+			if len(modifier) == 0 {
+				continue
+			}
+			parts := strings.Split(modifier, "=")
+			withPrivate := false
+			switch {
+			case modifier == "!":
+				withPrivate = true
+			case modifier == "*":
+				for _, m := range pool {
+					m.Picked = m.Exported || withPrivate
+					pool[m.Alias] = m
+				}
+			case modifier[0] == '-':
+				glob := NewGlob(modifier[1:])
+				for _, m := range pool {
+					if glob.Match(m.Recv.Type, m.Alias) {
+						m.Picked = false
+						pool[m.Alias] = m
+					}
+				}
+			case strings.HasPrefix(modifier, "wrap("):
+				selector := parts[0][5 : len(parts[0])-1]
+				glob := NewGlob(selector)
+				wrappers := strings.Split(parts[1], "|")
 				for _, wrapperName := range wrappers {
-					if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
-						for _, m := range builderMethods {
-							if m.Name == wrapperName {
-								compatible := m.Variadic
-								if !compatible && len(m.Params) == len(method.Results) {
-									compatible = true
-									for i := 0; i < len(m.Params); i++ {
-										if m.Params[i].Type.String() != method.Results[i].Type.String() {
-											compatible = false
-											break
-										}
-									}
+					parentMethod, ok := myMethodsMap[wrapperName]
+					if !ok {
+						continue
+					}
+					for _, method := range pool {
+						if !glob.Match(method.Recv.Type, method.Alias) {
+							continue
+						}
+						compatible := parentMethod.Variadic
+						if len(parentMethod.Params) == len(method.Results) {
+							compatible = true
+							for i := 0; i < len(parentMethod.Params); i++ {
+								if parentMethod.Params[i].Type.String() != method.Results[i].Type.String() {
+									compatible = false
+									break
 								}
-								if compatible {
-									method.WrapperName = wrapperName
-									method.Results = m.Results
-								}
-								break
 							}
 						}
+						if !compatible {
+							continue
+						}
+						generated := method
+						generated.Picked = method.Exported || withPrivate
+						generated.WrapperName = wrapperName
+						generated.Results = parentMethod.Results
+						pool[generated.Name] = generated
+					}
+				}
+			case strings.HasPrefix(modifier, "unwrap"):
+				names := strings.Split(parts[1], "|")
+				for _, unwrap := range names {
+					parentMethod, ok := myMethodsMap[unwrap]
+					if !ok {
+						continue
+					}
+					unwrappers[parentMethod.Results[0].Type.String()] = parentMethod
+				}
+			case strings.HasPrefix(modifier, "export("):
+				selector := parts[0][7 : len(parts[0])-1]
+				glob := NewGlob(selector)
+				for _, method := range pool {
+					if glob.Match(method.Recv.Type, method.Alias) {
+						method.PkgExport = true
+					}
+					pool[method.Alias] = method
+				}
+			case strings.HasPrefix(modifier, "ptr("):
+				selector := parts[0][4 : len(parts[0])-1]
+				glob := NewGlob(selector)
+				for _, method := range pool {
+					if glob.Match(method.Recv.Type, method.Alias) {
+						method.Pointer = true
+					}
+					pool[method.Alias] = method
+				}
+			case strings.HasPrefix(modifier, "pre("):
+				selector := parts[0][4 : len(parts[0])-1]
+				glob := NewGlob(selector)
+				for _, method := range pool {
+					if glob.Match(method.Recv.Type, method.Alias) {
+						method.Prefixes = append(method.Prefixes, parts[1])
+					}
+					pool[method.Alias] = method
+				}
+			case strings.HasPrefix(modifier, "post("):
+				selector := parts[0][5 : len(parts[0])-1]
+				glob := NewGlob(selector)
+				for _, method := range pool {
+					if glob.Match(method.Recv.Type, method.Alias) {
+						method.Postfixes = append(method.Postfixes, parts[1])
+					}
+					pool[method.Alias] = method
+				}
+			default:
+				left := NewGlob(parts[0])
+				var right *Glob
+				pick := true
+				if len(parts) > 1 {
+					if parts[1] == "-" {
+						pick = false
+					} else {
+						rightGlob := NewGlob(parts[1])
+						right = &rightGlob
+					}
+				}
+				newPool := make(map[string]Method, len(pool))
+				for _, method := range pool {
+					if left.Match(method.Recv.Type, method.Alias) {
+						method.Alias = left.Replace(method.Alias, right)
+						method.Picked = pick && (method.Exported || withPrivate)
 					}
 					newPool[method.Alias] = method
 				}
+				pool = newPool
 			}
-			pool = newPool
-		case strings.HasPrefix(modifier, "ptr("):
-			selector := parts[0][4 : len(parts[0])-1]
-			glob := NewGlob(selector)
-			newPool := make(map[string]Method, len(pool))
-			for _, method := range pool {
-				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
-					method.Pointer = true
+		}
+		for _, m := range pool {
+			if !m.Picked {
+				continue
+			}
+			_, ok := visited[m.Alias]
+			if ok {
+				continue
+			}
+			visited[m.Alias] = struct{}{}
+			recv := FuncParam{
+				Name: b.ReceiverName(),
+				Type: b.ReceiverType(),
+			}
+			if m.PkgExport {
+				m.Recv = recv
+				b.GeneratedFunctions = append(b.GeneratedFunctions, m)
+			}
+
+			if !child.IsMethod && m.IsChaining() {
+				param := recv
+				param.Name = ""
+				m.Results = []FuncParam{
+					param,
 				}
-				newPool[method.Alias] = method
 			}
-			pool = newPool
-		case strings.HasPrefix(modifier, "pre("):
-			selector := parts[0][4 : len(parts[0])-1]
-			glob := NewGlob(selector)
-			newPool := make(map[string]Method, len(pool))
-			for _, method := range pool {
-				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
-					method.Prefixes = append(method.Prefixes, parts[1])
-				}
-				newPool[method.Alias] = method
-			}
-			pool = newPool
-		case strings.HasPrefix(modifier, "post("):
-			selector := parts[0][5 : len(parts[0])-1]
-			glob := NewGlob(selector)
-			newPool := make(map[string]Method, len(pool))
-			for _, method := range pool {
-				if glob.Match(method.Recv.Named.Obj().Name(), method.Alias) {
-					method.Postfixes = append(method.Postfixes, parts[1])
-				}
-				newPool[method.Alias] = method
-			}
-			pool = newPool
-		default:
-			left := NewGlob(parts[0])
-			var right *Glob
-			if len(parts) > 1 {
-				rightGlob := NewGlob(parts[1])
-				right = &rightGlob
-			}
-			newPool := make(map[string]Method, len(pool))
-			for _, method := range pool {
-				if left.Match(method.Recv.Named.Obj().Name(), method.Alias) {
-					method.Alias = left.Replace(method.Alias, right)
-				}
-				newPool[method.Alias] = method
-			}
-			pool = newPool
+			m.Recv = recv
+			b.GeneratedMethods = append(b.GeneratedMethods, m)
 		}
 	}
-	result := make([]Method, 0, len(pool))
-	for _, original := range methods {
-		for _, altered := range pool {
-			if original.Pos == altered.Pos {
-				result = append(result, altered)
-				break
+	pool := make(map[string]Method, len(b.Methods))
+	for _, m := range b.Methods {
+		pool[m.Alias] = m
+	}
+	for _, modifier := range b.Annotations {
+		if len(modifier) == 0 {
+			continue
+		}
+		if strings.HasPrefix(modifier, "export(") {
+			parts := strings.Split(modifier, ":")
+			selector := parts[0][7 : len(parts[0])-1]
+			glob := NewGlob(selector)
+			for _, method := range pool {
+				if glob.Match(method.Recv.Type, method.Alias) {
+					method.PkgExport = method.Exported
+				}
+				pool[method.Alias] = method
 			}
 		}
 	}
-	return result, nil
+	for _, m := range pool {
+		if m.PkgExport {
+			b.GeneratedFunctions = append(b.GeneratedFunctions, m)
+		}
+	}
+}
+
+func (b *Builder) applyUnwrap() {
+	var add []Method
+	variadicUnwraps := make(map[string]struct{})
+	for mi, m := range b.GeneratedMethods {
+		for i, param := range m.Params {
+			if sl, ok := param.Type.(*types.Slice); ok {
+				unwrap, ok := unwrappers[sl.Elem().String()]
+				if !ok {
+					continue
+				}
+
+				param.Type = types.NewSlice(unwrap.Recv.Type)
+				param.Prefix = "new(__TYPE__).gen_" + unwrap.Name + "("
+				param.Suffix = ")"
+				if m.Variadic {
+					param.Suffix += "..."
+				}
+				unwrapType := unwrap.Recv.Type.String()
+				methodType := m.Recv.Type.String()
+				if _, ok := variadicUnwraps[sl.Elem().String()]; !ok && unwrapType == methodType {
+					variadicUnwraps[sl.Elem().String()] = struct{}{}
+					variadicMethod := Method{
+						VariadicUnwrap: true,
+						Name:           "gen_" + unwrap.Name,
+						Alias:          "gen_" + unwrap.Name,
+						Builder:        b,
+						Recv: FuncParam{
+							Name: "",
+							Type: sl.Elem(),
+						},
+						Variadic: true,
+						Params: []FuncParam{
+							{
+								Name:   "in",
+								Type:   types.NewSlice(unwrap.Recv.Type),
+								Suffix: unwrap.Name + "()",
+							},
+						},
+						Results: []FuncParam{
+							{
+								Type: types.NewSlice(unwrap.Results[0].Type),
+							},
+						},
+					}
+					add = append(add, variadicMethod)
+				}
+			} else {
+				unwrap, ok := unwrappers[param.Type.String()]
+				if !ok {
+					continue
+				}
+				param.Type = unwrap.Recv.Type
+				param.Suffix = "." + unwrap.Name + "()"
+			}
+			m.Params[i] = param
+		}
+		b.GeneratedMethods[mi] = m
+	}
+	b.GeneratedMethods = append(b.GeneratedMethods, add...)
 }
 
 type Glob struct {
@@ -554,7 +746,12 @@ func NewGlob(glob string) Glob {
 	}
 }
 
-func (g Glob) Match(typeName string, str string) bool {
+func (g Glob) Match(typ types.Type, str string) bool {
+	var typeName string
+	named, ok := typ.(*types.Named)
+	if ok {
+		typeName = named.Obj().Name()
+	}
 	if g.TypeName != "" && g.TypeName != typeName {
 		return false
 	}
@@ -620,53 +817,21 @@ func (c Chaingen) render(files map[string]*File, builder *Builder) error {
 		return nil
 	}
 	builder.Rendered = true
-	for _, child := range builder.Children {
-		var methods []Method
-		if c.opts.Recursive {
-			err := c.render(files, child.Builder)
-			if err != nil {
-				return err
-			}
-			methods = append(methods, child.Builder.GeneratedMethods...)
+	for _, m := range builder.GeneratedMethods {
+		if !m.Exported && m.Builder.PkgPath != builder.PkgPath {
+			continue
 		}
-		methods = append(methods, child.Builder.Methods...)
-
-		methods, err := c.evalAnnotations(child.FieldAnnotation, methods, builder.Methods)
-		if err != nil {
-			return err
+		if conflict, ok := builder.MethodNames[m.Alias]; ok {
+			if c.opts.ErrOnConflict {
+				return fmt.Errorf("method naming conflict for %s.%s: %s and %s", builder.Type.Obj().Name(), m.Alias, conflict.String(), m.String())
+			}
+			continue
 		}
-		for _, m := range methods {
-			if !m.Exported && m.Builder.PkgPath != builder.PkgPath {
-				continue
-			}
-			if conflict, ok := builder.MethodNames[m.Alias]; ok {
-				if c.opts.ErrOnConflict {
-					return fmt.Errorf("method naming conflict for %s.%s: %s and %s", builder.Type.Obj().Name(), m.Alias, conflict.String(), m.String())
-				}
-				continue
-			}
-			switch {
-			case !child.IsMethod && m.IsChaining():
-				builder.RenderChainMethod(file, m)
-				builder.MethodNames[m.Alias] = &m
-				generated := m
-				generated.Name = generated.Alias
-				generated.Results = []MethodParam{
-					{
-						Type: builder.Type,
-					},
-				}
-				generated.Builder = builder
-				builder.GeneratedMethods = append(builder.GeneratedMethods, generated)
-			case m.IsFinalizer():
-				builder.RenderFinalizer(file, m)
-				builder.MethodNames[m.Alias] = &m
-				generated := m
-				generated.Name = generated.Alias
-				generated.Builder = builder
-				builder.GeneratedMethods = append(builder.GeneratedMethods, generated)
-			}
-		}
+		builder.RenderMethod(file, m)
+		builder.MethodNames[m.Alias] = &m
+	}
+	for _, f := range builder.GeneratedFunctions {
+		builder.RenderFunction(file, f)
 	}
 
 	return nil
@@ -703,14 +868,22 @@ func (c Chaingen) Generate() error {
 		return fmt.Errorf("errors occurred loading source code:\n%s\n", strings.Join(errors, "\n"))
 	}
 
-	found := make(map[*types.Named]*packages.Package)
+	type B struct {
+		T *types.Named
+		P *packages.Package
+	}
+
+	var found []B
 
 	names := strings.Split(c.opts.TypeName, ",")
 	for _, p := range pkgs {
 		for _, name := range names {
 			typ := builderType(objToType(p.Types.Scope().Lookup(name)))
 			if typ != nil {
-				found[typ] = p
+				found = append(found, B{
+					T: typ,
+					P: p,
+				})
 			}
 		}
 	}
@@ -719,16 +892,20 @@ func (c Chaingen) Generate() error {
 	}
 
 	builders := map[*types.Named]*Builder{}
-	for typ, pkg := range found {
-		err := c.NewBuilder(builders, pkg, typ)
+	for _, b := range found {
+		err := c.NewBuilder(builders, b.P, b.T)
 		if err != nil {
 			return fmt.Errorf("error creating builder: %w", err)
 		}
 	}
 
-	files, err := c.Render(builders)
-	if err != nil {
-		return fmt.Errorf("error generating code: %w", err)
+	files := make(map[string]*File)
+	for _, b := range found {
+		builder := builders[b.T]
+		err := c.render(files, builder)
+		if err != nil {
+			return fmt.Errorf("error generating code: %w", err)
+		}
 	}
 	for _, file := range files {
 		if file.Body.Len() == 0 {
@@ -822,15 +999,47 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 		}
 	}
 
+	if builder.Struct != nil {
+		for i := 0; i < builder.Struct.NumFields(); i++ {
+			field := builder.Struct.Field(i)
+			fieldAnnotation, _ := reflect.StructTag(builder.Struct.Tag(i)).Lookup(c.opts.StructTag)
+			if fieldAnnotation == "-" {
+				continue
+			}
+			typ := builderType(field.Type())
+			if typ == nil {
+				continue
+			}
+			name := typ.Obj().Name()
+			if !field.Embedded() {
+				name = field.Name()
+			}
+			childPkg := pkg
+			pkgPath := typ.Obj().Pkg().Path()
+			if pkgPath != pkg.PkgPath {
+				childPkg = pkg.Imports[pkgPath]
+			}
+			if childPkg == nil {
+				continue
+			}
+			child, err := c.newBuilder(builders, childPkg, typ, depth+1)
+			if err != nil {
+				return nil, fmt.Errorf("error creating builder for field %s: %w", field.Name(), err)
+			}
+			ref := &BuilderRef{
+				Name:            name,
+				FieldAnnotation: fieldAnnotation,
+				Builder:         child,
+			}
+			builder.Children = append(builder.Children, ref)
+		}
+	}
 	for _, annotation := range builder.Annotations {
 		if strings.HasPrefix(annotation, "ext(") {
 			methodName := annotation[4:strings.Index(annotation, ")")]
 			for _, method := range builder.Methods {
 				if method.Name != methodName {
 					continue
-				}
-				if len(method.Results) != 1 || len(method.Params) != 0 {
-					break
 				}
 				typ := builderType(method.Results[0].Type)
 				if typ == nil {
@@ -850,7 +1059,7 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 					return nil, fmt.Errorf("error creating external builder %s: %w", methodName, err)
 				}
 				var fieldAnnotation string
-				parts := strings.Split(annotation, "=")
+				parts := strings.Split(annotation, ":")
 				if len(parts) == 2 {
 					fieldAnnotation = parts[1]
 				}
@@ -864,39 +1073,8 @@ func (c Chaingen) newBuilder(builders map[*types.Named]*Builder, pkg *packages.P
 			}
 		}
 	}
-	if builder.Struct == nil {
-		return builder, nil
-	}
-
-	for i := 0; i < builder.Struct.NumFields(); i++ {
-		field := builder.Struct.Field(i)
-		fieldAnnotation, _ := reflect.StructTag(builder.Struct.Tag(i)).Lookup(c.opts.StructTag)
-		typ := builderType(field.Type())
-		if typ == nil {
-			continue
-		}
-		name := typ.Obj().Name()
-		if !field.Embedded() {
-			name = field.Name()
-		}
-		childPkg := pkg
-		pkgPath := typ.Obj().Pkg().Path()
-		if pkgPath != pkg.PkgPath {
-			childPkg = pkg.Imports[pkgPath]
-		}
-		if childPkg == nil {
-			continue
-		}
-		child, err := c.newBuilder(builders, childPkg, typ, depth+1)
-		if err != nil {
-			return nil, fmt.Errorf("error creating builder for field %s: %w", field.Name(), err)
-		}
-		builder.Children = append(builder.Children, &BuilderRef{
-			Name:            name,
-			FieldAnnotation: fieldAnnotation,
-			Builder:         child,
-		})
-	}
+	builder.generateMethods()
+	builder.applyUnwrap()
 
 	return builder, nil
 }
